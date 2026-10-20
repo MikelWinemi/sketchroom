@@ -4,21 +4,29 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
-    "preview": "vite preview",
-    "typecheck": "tsc"
+    "dev": "concurrently -k -n server,web -c blue,green \"node --watch server/index.ts\" \"vite\"",
+    "build": "npm run typecheck && vite build",
+    "start": "node server/index.ts",
+    "preview": "npm run build && npm start",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.server.json"
   },
   "dependencies": {
+    "@hocuspocus/provider": "^4.7.1",
+    "@hocuspocus/server": "^4.7.1",
     "lucide-react": "^1.59.0",
     "perfect-freehand": "^1.2.3",
     "react": "^19.3.1",
-    "react-dom": "^19.3.1"
+    "react-dom": "^19.3.1",
+    "ws": "^8.22.0",
+    "yjs": "^13.6.33"
   },
   "devDependencies": {
+    "@types/node": "^26.6.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.2",
     "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.6",
     "typescript": "^7.0.2",
     "vite": "^8.3.4"
   }

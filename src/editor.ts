@@ -10,7 +10,6 @@ import {
   sortedShapes,
   type Box,
   type Camera,
-  type Doc,
   type Shape,
   type SizeKey,
   type TextShape,
@@ -18,6 +17,7 @@ import {
   type Vec,
 } from './model';
 import {
+  FONT_FAMILY,
   LINE_HEIGHT,
   boxContains,
   boxFromPoints,
@@ -32,7 +32,6 @@ import {
 } from './geometry';
 import { drawShape } from './render';
 
-const STORAGE_KEY = 'sketchroom:doc:v1';
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 8;
 // Interaction distances are in screen pixels so they feel the same at any zoom
@@ -77,6 +76,23 @@ type Interaction =
   | { type: 'resize'; handle: Handle; start: Vec; box: Box; originals: Shape[] }
   | { type: 'marquee'; start: Vec; current: Vec; base: Set<string> };
 
+/** Another person on the board, as broadcast through awareness. */
+export interface Peer {
+  clientId: number;
+  name: string;
+  color: string;
+  cursor: Vec | null;
+  selection: string[];
+}
+
+/** Ephemeral multiplayer state (cursors, selections) — never stored in the document. */
+export interface Presence {
+  peers(): Peer[];
+  subscribe(fn: () => void): () => void;
+  setCursor(p: Vec | null): void;
+  setSelection(ids: string[]): void;
+}
+
 export interface TextEdit {
   id: string;
   x: number;
@@ -97,19 +113,11 @@ export interface UiState {
   canRedo: boolean;
   camera: Camera;
   editing: TextEdit | null;
+  readOnly: boolean;
 }
 
 const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
 const pressureOf = (e: PointerEvent) => (e.pointerType === 'pen' && e.pressure > 0 ? e.pressure : 0.5);
-
-function loadDoc(): Doc {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}');
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
-}
 
 /**
  * The whiteboard engine. Owns the document store, camera, tools and selection,
@@ -117,13 +125,15 @@ function loadDoc(): Doc {
  * around it via getUi()/subscribeUi().
  */
 export class Editor {
-  readonly store = new Store(loadDoc());
+  readonly store: Store;
+  readonly presence: Presence | null;
   camera: Camera = { x: 0, y: 0, z: 1 };
   tool: Tool = 'pen';
   color = COLORS[0];
   size: SizeKey = 'm';
   selection = new Set<string>();
   editing: TextEdit | null = null;
+  readOnly = false;
 
   private interaction: Interaction = { type: 'idle' };
   private erasing = new Set<string>();
@@ -138,16 +148,17 @@ export class Editor {
   private width = 0;
   private height = 0;
   private frame = 0;
-  private saveTimer = 0;
+  private sentSelection = '';
 
   private ui: UiState;
   private uiListeners = new Set<() => void>();
 
-  constructor() {
+  constructor(store: Store, presence: Presence | null = null) {
+    this.store = store;
+    this.presence = presence;
     this.ui = this.computeUi();
     this.store.subscribe(() => {
       for (const id of this.selection) if (!this.store.get()[id]) this.selection.delete(id);
-      this.scheduleSave();
       this.requestRender();
       this.emitUi();
     });
@@ -164,6 +175,8 @@ export class Editor {
     this.updateCursor();
 
     const preventMenu = (e: Event) => e.preventDefault();
+    const onLeave = () => this.presence?.setCursor(null);
+    const unsubscribePresence = this.presence?.subscribe(() => this.requestRender());
     const onBlur = () => {
       this.spaceDown = false;
       this.updateCursor();
@@ -172,12 +185,12 @@ export class Editor {
     canvas.addEventListener('pointermove', this.onPointerMove);
     canvas.addEventListener('pointerup', this.onPointerUp);
     canvas.addEventListener('pointercancel', this.onPointerUp);
+    canvas.addEventListener('pointerleave', onLeave);
     canvas.addEventListener('wheel', this.onWheel, { passive: false });
     canvas.addEventListener('contextmenu', preventMenu);
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', onBlur);
-    window.addEventListener('pagehide', this.saveNow);
 
     return () => {
       observer.disconnect();
@@ -185,12 +198,13 @@ export class Editor {
       canvas.removeEventListener('pointermove', this.onPointerMove);
       canvas.removeEventListener('pointerup', this.onPointerUp);
       canvas.removeEventListener('pointercancel', this.onPointerUp);
+      canvas.removeEventListener('pointerleave', onLeave);
       canvas.removeEventListener('wheel', this.onWheel);
       canvas.removeEventListener('contextmenu', preventMenu);
       window.removeEventListener('keydown', this.onKeyDown);
       window.removeEventListener('keyup', this.onKeyUp);
       window.removeEventListener('blur', onBlur);
-      window.removeEventListener('pagehide', this.saveNow);
+      unsubscribePresence?.();
       cancelAnimationFrame(this.frame);
       this.frame = 0;
       this.canvas = null;
@@ -236,32 +250,23 @@ export class Editor {
       canRedo: this.store.canRedo,
       camera: this.camera,
       editing: this.editing,
+      readOnly: this.readOnly,
     };
   }
 
   private emitUi() {
+    // Every selection change ends up here, so this is where peers hear about it
+    const selection = [...this.selection].join(',');
+    if (selection !== this.sentSelection) {
+      this.sentSelection = selection;
+      this.presence?.setSelection([...this.selection]);
+    }
     const next = this.computeUi();
     const prev = this.ui;
     if ((Object.keys(next) as (keyof UiState)[]).every((k) => next[k] === prev[k])) return;
     this.ui = next;
     for (const fn of this.uiListeners) fn();
   }
-
-  // ---- Persistence (local only for now; replaced by the sync server later) ----
-
-  private scheduleSave() {
-    clearTimeout(this.saveTimer);
-    this.saveTimer = window.setTimeout(this.saveNow, 300);
-  }
-
-  private saveNow = () => {
-    clearTimeout(this.saveTimer);
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.store.get()));
-    } catch {
-      // Storage full or unavailable; the board still works in memory
-    }
-  };
 
   // ---- Coordinates & camera ----
 
@@ -328,7 +333,19 @@ export class Editor {
 
   // ---- Tools & style ----
 
+  /** Viewers can only pan and zoom. */
+  setReadOnly(readOnly: boolean) {
+    if (readOnly === this.readOnly) return;
+    if (readOnly) {
+      if (this.editing) this.commitText();
+      if (this.interaction.type !== 'idle') this.cancelInteraction();
+    }
+    this.readOnly = readOnly;
+    this.setTool(readOnly ? 'hand' : 'pen');
+  }
+
   setTool(tool: Tool) {
+    if (this.readOnly && tool !== 'hand') return;
     if (this.editing) this.commitText();
     this.tool = tool;
     if (tool !== 'select') this.selection = new Set();
@@ -376,6 +393,11 @@ export class Editor {
   private updateSelected(fn: (s: Shape) => Shape) {
     const shapes = this.selectedShapes();
     if (shapes.length) this.store.apply((doc) => putShapes(doc, shapes.map(fn)));
+  }
+
+  /** What an export should contain: the selection if there is one, otherwise the whole board. */
+  exportShapes(): Shape[] {
+    return this.selection.size ? this.selectedShapes() : sortedShapes(this.store.get());
   }
 
   selectAll() {
@@ -514,11 +536,13 @@ export class Editor {
       return;
     }
     if (this.interaction.type !== 'idle') return;
+    // preventDefault above stops the browser from moving focus, so release inputs ourselves
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
 
     const sp = this.screenPoint(e);
     const p = this.screenToWorld(sp);
 
-    if (e.button === 1 || (e.button === 0 && (this.spaceDown || this.tool === 'hand'))) {
+    if (e.button === 1 || (e.button === 0 && (this.spaceDown || this.tool === 'hand' || this.readOnly))) {
       this.capture(e);
       this.interaction = { type: 'pan', startX: sp.x, startY: sp.y, startCam: this.camera };
       this.updateCursor();
@@ -596,6 +620,7 @@ export class Editor {
     const sp = this.screenPoint(e);
     const p = this.screenToWorld(sp);
     const it = this.interaction;
+    this.presence?.setCursor(p);
 
     switch (it.type) {
       case 'idle':
@@ -833,6 +858,7 @@ export class Editor {
     }
 
     const key = e.key.toLowerCase();
+    if (this.readOnly) return this.onViewerKeyDown(e, key);
     if (this.interaction.type !== 'idle') {
       if (key === 'escape') this.cancelInteraction();
       return;
@@ -929,6 +955,16 @@ export class Editor {
     e.preventDefault();
   };
 
+  private onViewerKeyDown(e: KeyboardEvent, key: string) {
+    const mod = e.metaKey || e.ctrlKey;
+    if (mod && (key === '=' || key === '+')) this.zoomBy(1.25);
+    else if (mod && key === '-') this.zoomBy(0.8);
+    else if (mod && key === '0') this.resetZoom();
+    else if (e.code === 'Digit1' && e.shiftKey) this.zoomToFit();
+    else return;
+    e.preventDefault();
+  }
+
   private onKeyUp = (e: KeyboardEvent) => {
     if (e.code === 'Space') {
       this.spaceDown = false;
@@ -988,6 +1024,9 @@ export class Editor {
 
   private drawOverlays(ctx: CanvasRenderingContext2D) {
     const it = this.interaction;
+    const peers = this.presence?.peers() ?? [];
+    this.drawPeerSelections(ctx, peers);
+
     ctx.strokeStyle = ACCENT;
     ctx.lineWidth = 1;
 
@@ -1021,5 +1060,55 @@ export class Editor {
       ctx.fillRect(b.minX, b.minY, b.maxX - b.minX, b.maxY - b.minY);
       ctx.strokeRect(b.minX, b.minY, b.maxX - b.minX, b.maxY - b.minY);
     }
+
+    for (const peer of peers) if (peer.cursor) this.drawPeerCursor(ctx, peer);
+  }
+
+  private drawPeerSelections(ctx: CanvasRenderingContext2D, peers: Peer[]) {
+    const doc = this.store.get();
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    for (const peer of peers) {
+      ctx.strokeStyle = peer.color;
+      for (const id of peer.selection) {
+        const s = doc[id];
+        if (!s) continue;
+        const b = this.toScreenBox(shapeBounds(s), SELECTION_PAD);
+        ctx.strokeRect(b.minX, b.minY, b.maxX - b.minX, b.maxY - b.minY);
+      }
+    }
+    ctx.setLineDash([]);
+  }
+
+  private drawPeerCursor(ctx: CanvasRenderingContext2D, peer: Peer) {
+    const { x, y } = this.worldToScreen(peer.cursor!);
+    if (x < -20 || y < -20 || x > this.width + 20 || y > this.height + 20) return;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(0, 16);
+    ctx.lineTo(4.5, 12);
+    ctx.lineTo(8, 19);
+    ctx.lineTo(10.5, 18);
+    ctx.lineTo(7.2, 11);
+    ctx.lineTo(12.5, 11);
+    ctx.closePath();
+    ctx.fillStyle = peer.color;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.5;
+    ctx.lineJoin = 'round';
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.font = `600 12px ${FONT_FAMILY}`;
+    ctx.textBaseline = 'middle';
+    const width = ctx.measureText(peer.name).width + 12;
+    ctx.beginPath();
+    ctx.roundRect(10, 20, width, 20, 6);
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(peer.name, 16, 30.5);
+    ctx.restore();
   }
 }

@@ -1,34 +1,84 @@
-import type { Doc } from './model';
+import * as Y from 'yjs';
+import type { Doc, Shape } from './model';
 
-const MAX_HISTORY = 200;
+/** How often live gesture changes (drawing, dragging) are sent to collaborators. */
+const FLUSH_INTERVAL_MS = 50;
 
 /**
- * Holds the current document and its undo/redo history.
+ * The shared document: a Yjs map of shapes, exposed to the editor as an
+ * immutable snapshot (`Doc`) with undo/redo.
  *
- * Gestures (dragging, drawing) call begin(), then set() many times, then end(),
- * so the whole gesture becomes a single undo step.
+ * Gestures call begin(), then set() many times, then end(). Changes inside a
+ * gesture apply locally right away but go to the Yjs doc (and the network)
+ * at most every FLUSH_INTERVAL_MS, and the whole gesture is one undo step.
+ * Undo only reverts this user's own changes.
  */
 export class Store {
-  private doc: Doc;
-  private undoStack: Doc[] = [];
-  private redoStack: Doc[] = [];
-  private batchStart: Doc | null = null;
-  private listeners = new Set<() => void>();
+  private readonly ydoc: Y.Doc;
+  private readonly map: Y.Map<Shape>;
+  private readonly undoManager: Y.UndoManager;
+  /** Marks transactions made by this store, so undo only tracks local edits. */
+  private readonly origin = {};
+  private readonly listeners = new Set<() => void>();
 
-  constructor(initial: Doc) {
-    this.doc = initial;
+  private snapshot: Doc;
+  /** Local changes not yet written to the Yjs doc, and the snapshot they were based on. */
+  private pending: Doc | null = null;
+  private pendingBase: Doc | null = null;
+  private flushTimer = 0;
+  private inBatch = false;
+  private flushedInBatch = false;
+
+  readOnly = false;
+
+  constructor(ydoc: Y.Doc) {
+    this.ydoc = ydoc;
+    this.map = ydoc.getMap<Shape>('shapes');
+    this.snapshot = this.map.toJSON() as Doc;
+    // stopCapturing() at gesture boundaries decides what merges into one undo step
+    this.undoManager = new Y.UndoManager(this.map, { trackedOrigins: new Set([this.origin]), captureTimeout: Infinity });
+    this.undoManager.on('stack-item-added', this.emit);
+    this.undoManager.on('stack-item-popped', this.emit);
+    this.map.observe(this.onYChange);
   }
 
+  destroy() {
+    this.flush();
+    this.map.unobserve(this.onYChange);
+    this.undoManager.destroy();
+    this.listeners.clear();
+  }
+
+  private onYChange = (event: Y.YMapEvent<Shape>, tx: Y.Transaction) => {
+    // Update the snapshot incrementally so unchanged shapes keep their identity (and caches)
+    const next = { ...this.snapshot };
+    for (const [id, change] of event.changes.keys) {
+      if (change.action === 'delete') delete next[id];
+      else next[id] = this.map.get(id)!;
+    }
+    this.snapshot = next;
+
+    // A collaborator changed the doc mid-gesture: replay our unsent changes on top
+    if (this.pending && this.pendingBase && tx.origin !== this.origin) {
+      const rebased = { ...next };
+      for (const id in this.pending) if (this.pending[id] !== this.pendingBase[id]) rebased[id] = this.pending[id];
+      for (const id in this.pendingBase) if (!(id in this.pending)) delete rebased[id];
+      this.pending = rebased;
+      this.pendingBase = next;
+    }
+    this.emit();
+  };
+
   get(): Doc {
-    return this.doc;
+    return this.pending ?? this.snapshot;
   }
 
   get canUndo() {
-    return this.undoStack.length > 0;
+    return this.undoManager.undoStack.length > 0;
   }
 
   get canRedo() {
-    return this.redoStack.length > 0;
+    return this.undoManager.redoStack.length > 0;
   }
 
   subscribe(fn: () => void): () => void {
@@ -37,67 +87,85 @@ export class Store {
   }
 
   begin() {
-    this.batchStart ??= this.doc;
+    if (this.inBatch) return;
+    this.inBatch = true;
+    this.flushedInBatch = false;
+    this.undoManager.stopCapturing();
   }
 
-  /** Replaces the document. Outside a batch the change is not recorded in history. */
   set(doc: Doc) {
-    if (doc === this.doc) return;
-    this.doc = doc;
+    if (this.readOnly || doc === this.get()) return;
+    if (!this.pending) this.pendingBase = this.snapshot;
+    this.pending = doc;
+    if (!this.inBatch) this.flush();
+    else if (!this.flushTimer) this.flushTimer = window.setTimeout(() => this.flush(), FLUSH_INTERVAL_MS);
     this.emit();
   }
 
   end() {
-    const start = this.batchStart;
-    if (!start) return;
-    this.batchStart = null;
-    if (start !== this.doc) {
-      this.undoStack.push(start);
-      if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
-      this.redoStack = [];
-    }
+    if (!this.inBatch) return;
+    this.flush();
+    this.inBatch = false;
+    this.undoManager.stopCapturing();
     this.emit();
   }
 
-  /** Abandons the current batch and restores the document from before it. */
+  /** Abandons the current gesture, reverting anything it already sent. */
   cancel() {
-    const start = this.batchStart;
-    if (!start) return;
-    this.batchStart = null;
-    this.doc = start;
+    if (!this.inBatch) return;
+    this.inBatch = false;
+    clearTimeout(this.flushTimer);
+    this.flushTimer = 0;
+    this.pending = null;
+    this.pendingBase = null;
+    if (this.flushedInBatch) {
+      this.undoManager.undo();
+      this.undoManager.redoStack.pop();
+    }
+    this.undoManager.stopCapturing();
     this.emit();
   }
 
   /** Applies a single change as its own undo step. */
   apply(fn: (doc: Doc) => Doc) {
-    if (this.batchStart) {
-      this.set(fn(this.doc));
-      return;
-    }
+    if (this.inBatch) return this.set(fn(this.get()));
     this.begin();
-    this.set(fn(this.doc));
+    this.set(fn(this.get()));
     this.end();
   }
 
   undo() {
-    if (this.batchStart) return;
-    const prev = this.undoStack.pop();
-    if (!prev) return;
-    this.redoStack.push(this.doc);
-    this.doc = prev;
-    this.emit();
+    if (!this.inBatch && !this.readOnly) this.undoManager.undo();
   }
 
   redo() {
-    if (this.batchStart) return;
-    const next = this.redoStack.pop();
-    if (!next) return;
-    this.undoStack.push(this.doc);
-    this.doc = next;
-    this.emit();
+    if (!this.inBatch && !this.readOnly) this.undoManager.redo();
   }
 
-  private emit() {
-    for (const fn of this.listeners) fn();
+  private flush() {
+    clearTimeout(this.flushTimer);
+    this.flushTimer = 0;
+    const { pending, pendingBase } = this;
+    if (!pending || !pendingBase) return;
+    this.pending = null;
+    this.pendingBase = null;
+    let changed = false;
+    this.ydoc.transact(() => {
+      for (const id in pending) {
+        if (pending[id] === pendingBase[id]) continue;
+        this.map.set(id, pending[id]);
+        changed = true;
+      }
+      for (const id in pendingBase) {
+        if (id in pending) continue;
+        this.map.delete(id);
+        changed = true;
+      }
+    }, this.origin);
+    if (changed && this.inBatch) this.flushedInBatch = true;
   }
+
+  private emit = () => {
+    for (const fn of this.listeners) fn();
+  };
 }

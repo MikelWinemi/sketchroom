@@ -1,4 +1,4 @@
-import { Circle, Eraser, Hand, Minus, MousePointer2, MoveUpRight, Pencil, Square, Type, type LucideIcon } from 'lucide-react';
+import { Circle, Eraser, Eye, Hand, Minus, MousePointer2, MoveUpRight, Pencil, Square, Type, type LucideIcon } from 'lucide-react';
 import type { Editor, UiState } from '../editor';
 import { TOOL_SHORTCUTS, type Tool } from '../model';
 import { keepFocus } from './keepFocus';
@@ -16,6 +16,14 @@ const TOOLS: { tool: Tool; label: string; Icon: LucideIcon }[] = [
 ];
 
 export function Toolbar({ editor, ui }: { editor: Editor; ui: UiState }) {
+  if (ui.readOnly) {
+    return (
+      <div className="panel toolbar view-only" role="status">
+        <Eye size={16} />
+        View only
+      </div>
+    );
+  }
   return (
     <div className="panel toolbar" role="toolbar" aria-label="Tools" onPointerDown={keepFocus}>
       {TOOLS.map(({ tool, label, Icon }) => (

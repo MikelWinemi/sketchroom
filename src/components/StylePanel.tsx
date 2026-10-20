@@ -11,6 +11,7 @@ const SIZE_OPTIONS: { size: SizeKey; label: string }[] = [
 
 export function StylePanel({ editor, ui }: { editor: Editor; ui: UiState }) {
   const drawing = !['select', 'hand', 'eraser'].includes(ui.tool);
+  if (ui.readOnly) return null;
   if (!drawing && !ui.hasSelection && !ui.editing) return null;
 
   return (
